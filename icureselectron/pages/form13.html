@@ -2521,31 +2521,54 @@
       } catch { return null }
     }
 
+    // Depth-first search for the first non-null value of `key` anywhere in a
+    // parsed-plist tree, preferring a match on the object's own key before
+    // descending. iOS 27 moved the battery gas-gauge keys (DesignCapacity,
+    // Temperature, NominalChargeCapacity, CycleCount, …) out of the top-level
+    // AppleSmartBattery dict into a nested child dict (e.g. BatteryData) while
+    // leaving CurrentCapacity at the top — this finds them wherever they land.
+    function deepFind(obj, key) {
+      if (obj == null || typeof obj !== 'object') return undefined
+      if (!Array.isArray(obj) && obj[key] != null) return obj[key]
+      for (const v of Array.isArray(obj) ? obj : Object.values(obj)) {
+        const found = deepFind(v, key)
+        if (found !== undefined) return found
+      }
+      return undefined
+    }
+
     // ── Parse AppleSmartBattery plist into a flat object ──────────────────────
     function parseBattery(xml) {
       if (!xml) return null
       const p = parsePlist(xml)
       const r = p?.IORegistry
-      if (!r || r.CurrentCapacity == null) return null
-      const design = r.DesignCapacity || 0
-      const maxCap = r.MaxCapacity || 0
+      if (!r) return null
+      // Pull each key from wherever it lives in the tree (top-level on older
+      // iOS, nested under BatteryData on iOS 27+). `g` normalises absent → undefined.
+      const g = (k) => { const v = deepFind(r, k); return v == null ? undefined : v }
+      const current = g('CurrentCapacity')
+      if (current == null) return null
+      const design = g('DesignCapacity') || 0
+      const maxCap = g('MaxCapacity') || 0
       // AppleARMPMUCharger can store CurrentCapacity/MaxCapacity as raw mAh (MaxCapacity > 100)
       // or as a 0-100 percentage (MaxCapacity = 100). AppleSmartBattery always uses percentage.
       let level, nominalMah
       if (maxCap > 100) {
         nominalMah = maxCap
-        level = maxCap > 0 ? Math.round((r.CurrentCapacity / maxCap) * 100) : 0
+        level = maxCap > 0 ? Math.round((current / maxCap) * 100) : 0
       } else {
-        nominalMah = r.NominalChargeCapacity || r.AppleRawMaxCapacity || 0
-        level = r.CurrentCapacity
+        nominalMah = g('NominalChargeCapacity') || g('AppleRawMaxCapacity') || g('FullChargeCapacity') || 0
+        level = current
       }
+      const temp = g('Temperature')
+      const volt = g('Voltage')
       return {
         level,
-        isCharging: r.IsCharging === true,
-        cycleCount: r.CycleCount,
+        isCharging: g('IsCharging') === true,
+        cycleCount: g('CycleCount'),
         health: design > 0 ? Math.round((nominalMah / design) * 100) : null,
-        tempC: r.Temperature != null ? (r.Temperature / 100).toFixed(1) : null,
-        voltageV: r.Voltage != null ? (r.Voltage / 1000).toFixed(3) : null,
+        tempC: temp != null ? (temp / 100).toFixed(1) : null,
+        voltageV: volt != null ? (volt / 1000).toFixed(3) : null,
         designMah: design,
         nominalMah,
       }
@@ -2612,6 +2635,7 @@
         '0x8130': 'A17 Pro',    '0x8132': 'M4',
         '0x8140': 'A18 / A18 Pro', '0x8142': 'M5',
         '0x8150': 'A19 / A19 Pro',
+        '0x8160': 'A20 Pro',
       }
       const chip = CPID_CHIP[kv.CPID] || null
       const pwned = raw.toLowerCase().includes('pwnd') ? ' (Pwned)' : ''
@@ -2632,8 +2656,11 @@
       notched: `<rect x="1.5" y="1.5" width="59" height="121" rx="10" stroke="currentColor" stroke-width="1.5"/><rect x="2" y="2" width="58" height="120" rx="9" fill="currentColor" opacity=".055"/><path d="M18,1.5 H44 V7 Q44,10 40,10 H22 Q18,10 18,7 Z" fill="currentColor" opacity=".3"/>`,
       island: `<rect x="1.5" y="1.5" width="59" height="121" rx="10" stroke="currentColor" stroke-width="1.5"/><rect x="2" y="2" width="58" height="120" rx="9" fill="currentColor" opacity=".055"/><rect x="23" y="7" width="16" height="8" rx="4" fill="currentColor" opacity=".35"/>`,
       ipad:   `<rect x="1.5" y="1.5" width="85" height="121" rx="12" stroke="currentColor" stroke-width="1.5"/><rect x="5" y="16" width="78" height="88" rx="3" fill="currentColor" opacity=".055"/><rect x="31" y="8" width="26" height="3" rx="1.5" fill="currentColor" opacity=".4"/><circle cx="44" cy="113" r="5" stroke="currentColor" stroke-width="1.5"/>`,
+      // Unfolded book-style foldable: wide inner display with a dashed central
+      // hinge crease and an island camera cutout centred over the fold.
+      fold:   `<rect x="1.5" y="1.5" width="109" height="121" rx="10" stroke="currentColor" stroke-width="1.5"/><rect x="2" y="2" width="108" height="120" rx="9" fill="currentColor" opacity=".055"/><line x1="56" y1="3" x2="56" y2="121" stroke="currentColor" stroke-width="1" opacity=".35" stroke-dasharray="3 3"/><rect x="47" y="7" width="18" height="7" rx="3.5" fill="currentColor" opacity=".3"/>`,
     }
-    const SILHOUETTE_VB = { ipad: '0 0 88 124' }
+    const SILHOUETTE_VB = { ipad: '0 0 88 124', fold: '0 0 112 124' }
 
     function getDeviceEra(pt) {
       if (!pt) return 'tall'
@@ -2642,6 +2669,7 @@
       if (!m) return 'tall'
       const maj = +m[1], min = +m[2]
       if ((maj === 8 && min === 4) || (maj === 12 && min === 8) || (maj === 14 && min === 6)) return 'tall'
+      if (maj === 19 && min === 4) return 'fold'  // iPhone Duo (foldable)
       if (maj >= 15) return 'island'
       if ((maj === 10 && (min === 3 || min === 6)) || (maj >= 11 && maj <= 14)) return 'notched'
       if (maj >= 5) return 'tall'
@@ -2662,6 +2690,7 @@
         '0x8010': 'tall', '0x8015': 'tall',
         '0x8020': 'notched', '0x8030': 'notched', '0x8101': 'notched', '0x8110': 'notched',
         '0x8120': 'island', '0x8130': 'island', '0x8140': 'island', '0x8150': 'island',
+        '0x8160': 'island',
       }
       return CPID_ERA[cpid] || 'tall'
     }
@@ -2680,6 +2709,9 @@
     function goToFlash() { goToPanel('restore') }
 
     const MODEL_MAP = {
+      'iPhone19,7': 'iPhone 18 Pro Max', 'iPhone19,4': 'iPhone Duo', 'iPhone19,3': 'iPhone 18 Pro Max (US)', 'iPhone19,2': 'iPhone 18 Pro',
+      'iPhone18,5': 'iPhone 17e', 'iPhone18,4': 'iPhone Air', 'iPhone18,3': 'iPhone 17', 'iPhone18,2': 'iPhone 17 Pro Max', 'iPhone18,1': 'iPhone 17 Pro',
+      'iPhone17,5': 'iPhone 16e', 'iPhone17,4': 'iPhone 16 Plus', 'iPhone17,3': 'iPhone 16', 'iPhone17,2': 'iPhone 16 Pro Max', 'iPhone17,1': 'iPhone 16 Pro',
       'iPhone16,2': 'iPhone 15 Pro Max', 'iPhone16,1': 'iPhone 15 Pro', 'iPhone15,5': 'iPhone 15 Plus', 'iPhone15,4': 'iPhone 15',
       'iPhone15,3': 'iPhone 14 Pro Max', 'iPhone15,2': 'iPhone 14 Pro', 'iPhone14,8': 'iPhone 14 Plus', 'iPhone14,7': 'iPhone 14',
       'iPhone14,6': 'iPhone SE 3rd Gen', 'iPhone14,5': 'iPhone 13', 'iPhone14,4': 'iPhone 13 mini', 'iPhone14,3': 'iPhone 13 Pro Max',

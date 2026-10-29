@@ -223,12 +223,15 @@ if [[ "$PLATFORM" == mac ]]; then
   leaks=0
   for f in "$OUT_BIN"/* "$OUT_LIBS"/*.dylib; do
     [[ -f "$f" ]] || continue
-    # `tail -n +2` drops otool's first line — it echoes the file's own path,
-    # which (being under $REPO_ROOT/build) would otherwise match BAD_PATHS and
-    # flag every file as a false positive. Real load commands start on line 2.
-    if otool -l "$f" 2>/dev/null | tail -n +2 | grep -Eq "$BAD_PATHS"; then
+    # Keep only indented lines. otool's header lines ("<path>:" and, for a fat
+    # binary like gaster, one "<path> (architecture X):" per slice) sit flush
+    # left and echo the file's own path — which, being under $REPO_ROOT/build,
+    # would false-match BAD_PATHS. Real dependencies, rpaths and load-command
+    # fields are always indented, so this drops every header (single or
+    # per-arch) while keeping anything that would be an actual leak.
+    if otool -l "$f" 2>/dev/null | grep '^[[:space:]]' | grep -Eq "$BAD_PATHS"; then
       echo "  ✗ LEAK in $(basename "$f"):"
-      otool -L "$f" 2>/dev/null | tail -n +2 | grep -E "$BAD_PATHS" | sed 's/^/        dep   /' || true
+      otool -L "$f" 2>/dev/null | grep '^[[:space:]]' | grep -E "$BAD_PATHS" | sed 's/^/        dep   /' || true
       otool -l "$f" 2>/dev/null \
         | awk '/LC_RPATH/{r=1;next} r&&/ path /{print $2;r=0}' \
         | grep -E "$BAD_PATHS" | sed 's/^/        rpath /' || true
