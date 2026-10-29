@@ -174,6 +174,77 @@ if [[ "$PLATFORM" == mac ]]; then
       -p "@executable_path/../libs/"
   done
 
+  # ── Strip build-machine rpaths + verify no absolute paths leak ───────────
+  # autotools/libtool bakes the build-time --libdir ($STAGING/lib) into every
+  # binary and dylib as an LC_RPATH. dylibbundler rewrites LC_LOAD_DYLIB /
+  # LC_ID_DYLIB to @executable_path/../libs/ but leaves those LC_RPATHs in
+  # place, so any dependency still referenced as @rpath/… resolves through the
+  # absolute staging path at runtime. That path exists only on THIS build
+  # machine, so the app loads fine here but dies on every other machine with
+  #   "Library not loaded: …/deps-staging/lib/libplist…"
+  # and the renderer can't even read a UDID. Delete those rpaths, add proper
+  # relative ones so any surviving @rpath/… deps resolve to the bundled libs,
+  # then fail the build if anything absolute is still baked in.
+  echo ""
+  echo "━━━ Repairing load paths ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  BAD_PATHS="$STAGING|$REPO_ROOT/build|$BREW_PREFIX"
+
+  strip_bad_rpaths() {
+    local f="$1" rp
+    # Each LC_RPATH load command prints its value on the "path " line that
+    # follows the "cmd LC_RPATH" line in `otool -l`.
+    otool -l "$f" 2>/dev/null \
+      | awk '/LC_RPATH/{r=1;next} r&&/ path /{print $2;r=0}' \
+      | while IFS= read -r rp; do
+          case "$rp" in
+            "$STAGING"*|"$REPO_ROOT/build"*|"$BREW_PREFIX"*)
+              install_name_tool -delete_rpath "$rp" "$f" 2>/dev/null || true ;;
+          esac
+        done
+  }
+
+  for b in "${BINARIES[@]}"; do
+    [[ -f "$OUT_BIN/$b" ]] || continue
+    strip_bad_rpaths "$OUT_BIN/$b"
+    # Binaries live in bin/, bundled libs in ../libs (relative to either the
+    # executable or, under Rosetta/symlinks, the loader).
+    install_name_tool -add_rpath "@executable_path/../libs" "$OUT_BIN/$b" 2>/dev/null || true
+    install_name_tool -add_rpath "@loader_path/../libs"     "$OUT_BIN/$b" 2>/dev/null || true
+    echo "  → $b"
+  done
+  for f in "$OUT_LIBS"/*.dylib; do
+    [[ -f "$f" ]] || continue
+    strip_bad_rpaths "$f"
+    install_name_tool -add_rpath "@loader_path" "$f" 2>/dev/null || true
+  done
+
+  echo ""
+  echo "━━━ Verifying no build-machine paths remain ━━━━━━━━━━━━━━━━━━━━━"
+  leaks=0
+  for f in "$OUT_BIN"/* "$OUT_LIBS"/*.dylib; do
+    [[ -f "$f" ]] || continue
+    # `tail -n +2` drops otool's first line — it echoes the file's own path,
+    # which (being under $REPO_ROOT/build) would otherwise match BAD_PATHS and
+    # flag every file as a false positive. Real load commands start on line 2.
+    if otool -l "$f" 2>/dev/null | tail -n +2 | grep -Eq "$BAD_PATHS"; then
+      echo "  ✗ LEAK in $(basename "$f"):"
+      otool -L "$f" 2>/dev/null | tail -n +2 | grep -E "$BAD_PATHS" | sed 's/^/        dep   /' || true
+      otool -l "$f" 2>/dev/null \
+        | awk '/LC_RPATH/{r=1;next} r&&/ path /{print $2;r=0}' \
+        | grep -E "$BAD_PATHS" | sed 's/^/        rpath /' || true
+      leaks=1
+    fi
+  done
+  if [[ "$leaks" == 1 ]]; then
+    echo ""
+    echo "ERROR: absolute build-machine paths are still baked into the binaries"
+    echo "       listed above. They load on THIS machine (the paths exist here)"
+    echo "       but fail with 'Library not loaded: …' on every other machine."
+    echo "       Do not ship this build — fix the bundling first."
+    exit 1
+  fi
+  echo "  ✓ all binaries/dylibs reference only @executable_path / @loader_path"
+
   echo ""
   echo "━━━ Ad-hoc signing ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   for f in "$OUT_BIN"/* "$OUT_LIBS"/*.dylib; do
